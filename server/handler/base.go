@@ -17,7 +17,9 @@ package handler
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"strings"
+	"time"
 
 	"github.com/google/go-github/github"
 	"github.com/palantir/go-baseapp/baseapp"
@@ -27,6 +29,7 @@ import (
 
 	"github.com/palantir/policy-bot/policy"
 	"github.com/palantir/policy-bot/policy/common"
+	"github.com/palantir/policy-bot/policy/reviewer"
 	"github.com/palantir/policy-bot/pull"
 )
 
@@ -122,7 +125,7 @@ func (b *Base) PreparePRContext(ctx context.Context, installationID int64, pr *g
 	return ctx, logger
 }
 
-func (b *Base) Evaluate(ctx context.Context, installationID int64, loc pull.Locator) error {
+func (b *Base) Evaluate(ctx context.Context, installationID int64, performActions bool, loc pull.Locator) error {
 	client, err := b.NewInstallationClient(installationID)
 	if err != nil {
 		return err
@@ -144,10 +147,10 @@ func (b *Base) Evaluate(ctx context.Context, installationID int64, loc pull.Loca
 		return errors.WithMessage(err, fmt.Sprintf("failed to fetch policy: %s", fetchedConfig))
 	}
 
-	return b.EvaluateFetchedConfig(ctx, prctx, client, fetchedConfig)
+	return b.EvaluateFetchedConfig(ctx, prctx, performActions, client, fetchedConfig)
 }
 
-func (b *Base) EvaluateFetchedConfig(ctx context.Context, prctx pull.Context, client *github.Client, fetchedConfig FetchedConfig) error {
+func (b *Base) EvaluateFetchedConfig(ctx context.Context, prctx pull.Context, performActions bool, client *github.Client, fetchedConfig FetchedConfig) error {
 	logger := zerolog.Ctx(ctx)
 
 	if fetchedConfig.Missing() {
@@ -193,5 +196,48 @@ func (b *Base) EvaluateFetchedConfig(ctx context.Context, prctx pull.Context, cl
 		return errors.Errorf("evaluation resulted in unexpected state: %s", result.Status)
 	}
 
-	return b.PostStatus(ctx, prctx, client, statusState, statusDescription)
+	err = b.PostStatus(ctx, prctx, client, statusState, statusDescription)
+	if err != nil {
+		return err
+	}
+
+	if performActions && statusState == "pending" && !prctx.IsDraft() {
+		hasReviewers, err := prctx.HasReviewers()
+		if err != nil {
+			return errors.Wrap(err, "Unable to list request reviewers")
+		}
+
+		if !hasReviewers {
+			r := rand.New(rand.NewSource(time.Now().UnixNano()))
+			requestedUsers, err := reviewer.SelectReviewers(ctx, prctx, result, r)
+			if err != nil {
+				return errors.Wrap(err, "Unable to select random request reviewers")
+			}
+
+			// check again if someone assigned a reviewer while we were calculating users to request
+			hasReviewersAfter, err := prctx.HasReviewers()
+			if err != nil {
+				return errors.Wrap(err, "Unable to double-check existing reviewers, assuming original state is still valid")
+			}
+
+			if len(requestedUsers) > 0 && !hasReviewersAfter {
+				reviewers := github.ReviewersRequest{
+					Reviewers:     requestedUsers,
+					TeamReviewers: []string{},
+				}
+
+				logger.Debug().Msgf("PR is not in draft, there are no current reviewers, and reviews are requested from %q users", requestedUsers)
+				_, _, err = client.PullRequests.RequestReviewers(ctx, prctx.RepositoryOwner(), prctx.RepositoryName(), prctx.Number(), reviewers)
+				if err != nil {
+					return errors.Wrap(err, "Unable to request reviewers")
+				}
+			} else {
+				logger.Debug().Msg("No users found for review, no users were requested, or users were assigned during review calculation")
+			}
+		} else {
+			logger.Debug().Msg("PR has existing reviewers, not adding anyone")
+		}
+	}
+
+	return nil
 }

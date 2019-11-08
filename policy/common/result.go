@@ -37,12 +37,39 @@ func (s EvaluationStatus) String() string {
 	return "unknown"
 }
 
+type RequestMode string
+
+const (
+	RequestModeAllUsers    RequestMode = "all-users"
+	RequestModeRandomUsers RequestMode = "random-users"
+)
+
+type ReviewRequestRule struct {
+	Teams              []string
+	Users              []string
+	Organizations      []string
+	Admins             bool
+	WriteCollaborators bool
+	RequiredCount      int
+
+	Mode RequestMode
+}
+
 type Result struct {
-	Name        string
-	Description string
-	Status      EvaluationStatus
+	Name              string
+	Description       string
+	Status            EvaluationStatus
+	ReviewRequestRule ReviewRequestRule
 
 	Error error
 
 	Children []*Result
+}
+
+func (r Result) GetMode() RequestMode {
+	mode := RequestModeRandomUsers
+	if r.ReviewRequestRule.Mode != "" {
+		mode = r.ReviewRequestRule.Mode
+	}
+	return mode
 }
